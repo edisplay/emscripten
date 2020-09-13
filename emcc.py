@@ -178,8 +178,8 @@ VALID_ENVIRONMENTS = ('web', 'webview', 'worker', 'node', 'shell')
 def save_intermediate(name, suffix='js'):
   if not DEBUG:
     return
-  if isinstance(final, list):
-    logger.debug('(not saving intermediate %s because deferring linking)' % name)
+  if not final:
+    logger.debug('(not saving intermediate %s because not generating JS)' % name)
     return
   building.save_intermediate(final, name + '.' + suffix)
 
@@ -2067,7 +2067,7 @@ There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR P
 
     with ToolchainProfiler.profile_block('link'):
       logger.debug('linking: ' + str(linker_inputs))
-      final = in_temp(target_basename + '.wasm')
+      tmp_wasm = in_temp(target_basename + '.wasm')
 
       # if  EMCC_DEBUG=2  then we must link now, so the temp files are complete.
       # if using the wasm backend, we might be using vanilla LLVM, which does not allow our
@@ -2077,7 +2077,7 @@ There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR P
       if shared.Settings.LLD_REPORT_UNDEFINED and shared.Settings.ERROR_ON_UNDEFINED_SYMBOLS:
         js_funcs = get_all_js_syms(misc_temp_files)
         log_time('JS symbol generation')
-      building.link_lld(linker_inputs, final, external_symbol_list=js_funcs)
+      building.link_lld(linker_inputs, tmp_wasm, external_symbol_list=js_funcs)
       # Special handling for when the user passed '-Wl,--version'.  In this case the linker
       # does not create the output file, but just prints its version and exits with 0.
       if '--version' in linker_inputs:
@@ -2091,6 +2091,8 @@ There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR P
       # /dev/null, but that will take some refactoring
       return 0
 
+    wasm_only = shared.Settings.SIDE_MODULE or final_suffix in WASM_ENDINGS
+
     with ToolchainProfiler.profile_block('emscript'):
       # Emscripten
       logger.debug('LLVM => JS')
@@ -2102,20 +2104,33 @@ There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR P
       if embed_memfile(options):
         shared.Settings.SUPPORT_BASE64_EMBEDDING = 1
 
-      emscripten.run(final, final + '.o.js', shared.replace_or_append_suffix(target, '.mem'))
-      final = final + '.o.js'
+      if wasm_only:
+        final = None
+      else:
+        final = tmp_wasm + '.js'
+      emscripten.run(tmp_wasm, final, shared.replace_or_append_suffix(target, '.mem'))
 
       save_intermediate('original')
 
       # we also received the wasm at this stage
-      temp_basename = unsuffixed(final)
-      wasm_temp = temp_basename + '.wasm'
-      safe_move(wasm_temp, wasm_target)
+      safe_move(tmp_wasm, wasm_target)
       if use_source_map(options):
-        safe_move(wasm_temp + '.map', wasm_source_map_target)
+        safe_move(tmp_wasm + '.map', wasm_source_map_target)
 
     # exit block 'emscript'
     log_time('emscript (llvm => executable code)')
+
+    with ToolchainProfiler.profile_block('binaryen'):
+      memfile = None
+      if not shared.Settings.MEM_INIT_IN_WASM:
+         memfile = shared.replace_or_append_suffix(target, '.mem')
+      do_binaryen(target, options, memfile, wasm_target,
+                  wasm_source_map_target, misc_temp_files)
+
+    log_time('binaryen')
+    # If we are not emitting any JS then we are all done now
+    if wasm_only:
+      return
 
     with ToolchainProfiler.profile_block('source transforms'):
       # Embed and preload files
@@ -2166,10 +2181,6 @@ There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR P
     log_time('source transforms')
 
     with ToolchainProfiler.profile_block('memory initializer'):
-      memfile = None
-      if not shared.Settings.MEM_INIT_IN_WASM:
-         memfile = shared.replace_or_append_suffix(target, '.mem')
-
       if memfile:
         # For the wasm backend, we don't have any memory info in JS. All we need to do
         # is set the memory initializer url.
@@ -2179,15 +2190,6 @@ There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR P
         final += '.mem.js'
 
     log_time('memory initializer')
-
-    with ToolchainProfiler.profile_block('binaryen'):
-      do_binaryen(target, options, memfile, wasm_target,
-                  wasm_source_map_target, misc_temp_files)
-
-    log_time('binaryen')
-    # If we are not emitting any JS then we are all done now
-    if shared.Settings.SIDE_MODULE or final_suffix in WASM_ENDINGS:
-      return
 
     with ToolchainProfiler.profile_block('final emitting'):
       # Remove some trivial whitespace
@@ -2635,31 +2637,29 @@ def do_binaryen(target, options, memfile, wasm_target,
   if shared.Settings.EMIT_EMSCRIPTEN_METADATA:
     webassembly.add_emscripten_metadata(final, wasm_target)
 
-  if shared.Settings.SIDE_MODULE:
-    return # and we are done.
+  if final:
+    # pthreads memory growth requires some additional JS fixups
+    if shared.Settings.USE_PTHREADS and shared.Settings.ALLOW_MEMORY_GROWTH:
+      final = building.apply_wasm_memory_growth(final)
 
-  # pthreads memory growth requires some additional JS fixups
-  if shared.Settings.USE_PTHREADS and shared.Settings.ALLOW_MEMORY_GROWTH:
-    final = building.apply_wasm_memory_growth(final)
+    # >=2GB heap support requires pointers in JS to be unsigned. rather than
+    # require all pointers to be unsigned by default, which increases code size
+    # a little, keep them signed, and just unsign them here if we need that.
+    if shared.Settings.CAN_ADDRESS_2GB:
+      final = building.use_unsigned_pointers_in_js(final)
 
-  # >=2GB heap support requires pointers in JS to be unsigned. rather than
-  # require all pointers to be unsigned by default, which increases code size
-  # a little, keep them signed, and just unsign them here if we need that.
-  if shared.Settings.CAN_ADDRESS_2GB:
-    final = building.use_unsigned_pointers_in_js(final)
+    if shared.Settings.USE_ASAN:
+      final = building.instrument_js_for_asan(final)
 
-  if shared.Settings.USE_ASAN:
-    final = building.instrument_js_for_asan(final)
-
-  if shared.Settings.OPT_LEVEL >= 2 and shared.Settings.DEBUG_LEVEL <= 2:
-    # minify the JS
-    save_intermediate_with_wasm('preclean', wasm_target)
-    final = building.minify_wasm_js(js_file=final,
-                                    wasm_file=wasm_target,
-                                    expensive_optimizations=will_metadce(options),
-                                    minify_whitespace=minify_whitespace(),
-                                    debug_info=intermediate_debug_info)
-    save_intermediate_with_wasm('postclean', wasm_target)
+    if shared.Settings.OPT_LEVEL >= 2 and shared.Settings.DEBUG_LEVEL <= 2:
+      # minify the JS
+      save_intermediate_with_wasm('preclean', wasm_target)
+      final = building.minify_wasm_js(js_file=final,
+                                      wasm_file=wasm_target,
+                                      expensive_optimizations=will_metadce(options),
+                                      minify_whitespace=minify_whitespace(),
+                                      debug_info=intermediate_debug_info)
+      save_intermediate_with_wasm('postclean', wasm_target)
 
   if shared.Settings.ASYNCIFY_LAZY_LOAD_CODE:
     if not shared.Settings.ASYNCIFY:
@@ -2681,7 +2681,7 @@ def do_binaryen(target, options, memfile, wasm_target,
     save_intermediate_with_wasm('closure', wasm_target)
     return final
 
-  if options.use_closure_compiler:
+  if final and  options.use_closure_compiler:
     final = run_closure_compiler(final)
 
   symbols_file = shared.replace_or_append_suffix(target, '.symbols') if options.emit_symbol_map else None
@@ -2726,7 +2726,7 @@ def do_binaryen(target, options, memfile, wasm_target,
     wasm2c.do_wasm2c(wasm_target)
 
   # replace placeholder strings with correct subresource locations
-  if shared.Settings.SINGLE_FILE:
+  if final and shared.Settings.SINGLE_FILE:
     js = open(final).read()
 
     if '{{{ WASM_BINARY_DATA }}}' in js:
